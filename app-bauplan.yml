@@ -1,0 +1,254 @@
+# Baut aus index.html eine echte Android-App (Capacitor + Google AdMob) und stellt sie zum Herunterladen bereit.
+# Starten: GitHub -> Reiter "Actions" -> "Android-App bauen" -> "Run workflow".
+name: Android-App bauen
+
+on:
+  workflow_dispatch:
+
+env:
+  APP_ID: com.mayar.policecity
+  APP_NAME: Police City
+  # AdMob-App-ID. Das hier ist Googles Test-ID - gegen die echte ID aus dem AdMob-Konto tauschen.
+  ADMOB_APP_ID: ca-app-pub-3940256099942544~3347511713
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Spiel und Werbe-Baustein vorbereiten
+        run: |
+          pip install --quiet pillow
+          mkdir -p www out
+          python3 - <<'PYSEL'
+          import glob, re, shutil
+          # Nimmt die neueste Spiel-Datei (auch wenn das Handy sie als index-4.html o. ä. hochgeladen hat)
+          best, score = None, -1
+          for f in sorted(glob.glob('index*.html')):
+              t = open(f, encoding='utf-8', errors='ignore').read()
+              m = re.search(r'name="pc-build" content="(\d+)"', t)
+              sc = int(m.group(1)) if m else (1 if 'adsInit' in t else 0)
+              print(f, 'Version', sc)
+              if sc > score:
+                  best, score = f, sc
+          print('Verwende', best)
+          shutil.copy(best, 'www/index.html')
+          PYSEL
+          cat > package.json <<'EOF'
+          {
+            "name": "police-city-app",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^8.0.0",
+              "@capacitor/core": "^8.0.0",
+              "@capacitor-community/admob": "^8.0.0"
+            },
+            "devDependencies": {
+              "@capacitor/cli": "^8.0.0",
+              "esbuild": "^0.25.0"
+            }
+          }
+          EOF
+          cat > ads-entry.js <<'EOF'
+          import * as M from '@capacitor-community/admob';
+          window.PCAdMob = M;
+          EOF
+          node -e "require('fs').writeFileSync('capacitor.config.json', JSON.stringify({appId: process.env.APP_ID, appName: process.env.APP_NAME, webDir: 'www', backgroundColor: '#10151b', android: {appendUserAgent: 'PoliceCityApp', backgroundColor: '#10151b'}}, null, 2))"
+          npm install --no-audit --no-fund --legacy-peer-deps
+          npx esbuild ads-entry.js --bundle --minify --format=iife --outfile=www/ads-bundle.js
+
+      - name: Android-Projekt erzeugen und anpassen
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          npx cap add android
+          cat > patch_android.py <<'EOF'
+          # Passt das von Capacitor erzeugte Android-Projekt an: Querformat, Vollbild, Werbe-ID, Icons, Startbild, Versionsnummer.
+          import os, re, glob
+          from PIL import Image, ImageDraw
+
+          APP_ID = os.environ['APP_ID']
+          ADMOB = os.environ['ADMOB_APP_ID']
+          RUN = int(os.environ.get('RUN_NUMBER', '1'))
+          A = 'android/app/src/main'
+          RES = A + '/res'
+
+          def rd(p):
+              with open(p, encoding='utf-8') as f:
+                  return f.read()
+
+          def wr(p, s):
+              os.makedirs(os.path.dirname(p), exist_ok=True)
+              with open(p, 'w', encoding='utf-8') as f:
+                  f.write(s)
+
+          # 1) AndroidManifest: Querformat + AdMob-App-ID
+          p = A + '/AndroidManifest.xml'
+          s = rd(p)
+          if 'screenOrientation' not in s:
+              s = s.replace('<activity', '<activity\n            android:screenOrientation="sensorLandscape"', 1)
+          if 'com.google.android.gms.ads.APPLICATION_ID' not in s:
+              s = s.replace('</application>',
+                            '    <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="@string/admob_app_id"/>\n    </application>', 1)
+          wr(p, s)
+
+          # 2) strings.xml: AdMob-App-ID
+          p = RES + '/values/strings.xml'
+          s = rd(p)
+          s = re.sub(r'\s*<string name="admob_app_id">.*?</string>', '', s)
+          s = s.replace('</resources>', '    <string name="admob_app_id">%s</string>\n</resources>' % ADMOB)
+          wr(p, s)
+
+          # 3) Versionsnummer (muss bei jedem Play-Upload steigen) = Nummer des Bauvorgangs
+          p = 'android/app/build.gradle'
+          s = rd(p)
+          s, n1 = re.subn(r'versionCode\s*=?\s*\d+', 'versionCode %d' % RUN, s, count=1)
+          s, n2 = re.subn(r'versionName\s*=?\s*"[^"]*"', 'versionName "1.0.%d"' % RUN, s, count=1)
+          assert n1 == 1 and n2 == 1, 'versionCode/versionName nicht gefunden'
+          wr(p, s)
+
+          # 4) MainActivity: Vollbild (Statusleiste/Navigationsleiste aus), Bildschirm bleibt an, Kameraausschnitt nutzen
+          JAVA = '''package @PKG@;
+
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      WindowManager.LayoutParams lp = getWindow().getAttributes();
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                      getWindow().setAttributes(lp);
+                  }
+                  hideBars();
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) hideBars();
+              }
+
+              private void hideBars() {
+                  WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+                  WindowInsetsControllerCompat c = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+                  c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                  c.hide(WindowInsetsCompat.Type.systemBars());
+              }
+          }
+          '''
+          cands = glob.glob(A + '/java/**/MainActivity.*', recursive=True)
+          if cands:
+              d = os.path.dirname(cands[0])
+              pkg = re.search(r'package\s+([\w.]+)', rd(cands[0])).group(1)
+              for c in cands:
+                  os.remove(c)
+          else:
+              pkg = APP_ID
+              d = A + '/java/' + APP_ID.replace('.', '/')
+          wr(d + '/MainActivity.java', JAVA.replace('@PKG@', pkg))
+
+          # 5) Symbole: normales + rundes Symbol, Vordergrund für adaptive Symbole
+          icon = Image.open('icon-512.png').convert('RGB')
+          mask = Image.open('icon-maskable-512.png').convert('RGB')
+          for k, f in {'mdpi': 1, 'hdpi': 1.5, 'xhdpi': 2, 'xxhdpi': 3, 'xxxhdpi': 4}.items():
+              d = RES + '/mipmap-' + k
+              os.makedirs(d, exist_ok=True)
+              n, fg = round(48 * f), round(108 * f)
+              sq = icon.resize((n, n), Image.LANCZOS)
+              sq.save(d + '/ic_launcher.png')
+              rd_ = sq.convert('RGBA')
+              m = Image.new('L', (n, n), 0)
+              ImageDraw.Draw(m).ellipse((0, 0, n - 1, n - 1), fill=255)
+              rd_.putalpha(m)
+              rd_.save(d + '/ic_launcher_round.png')
+              mask.resize((fg, fg), Image.LANCZOS).save(d + '/ic_launcher_foreground.png')
+          ADAPT = ('<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                   '    <background android:drawable="@color/ic_launcher_background"/>\n'
+                   '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n</adaptive-icon>\n')
+          wr(RES + '/mipmap-anydpi-v26/ic_launcher.xml', ADAPT)
+          wr(RES + '/mipmap-anydpi-v26/ic_launcher_round.xml', ADAPT)
+          wr(RES + '/values/ic_launcher_background.xml',
+             '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#1B2F57</color>\n</resources>\n')
+
+          # 6) Startbild: dunkel mit Symbol statt Capacitor-Logo
+          for f in glob.glob(RES + '/drawable*/splash.png'):
+              w, h = Image.open(f).size
+              bg = Image.new('RGB', (w, h), (16, 21, 27))
+              sz = int(min(w, h) * 0.3)
+              bg.paste(icon.resize((sz, sz), Image.LANCZOS), ((w - sz) // 2, (h - sz) // 2))
+              bg.save(f)
+
+          # 7) Start-Design (Android 12+): dunkler Hintergrund – nur wenn das Design die Splash-Bibliothek nutzt
+          p = RES + '/values/styles.xml'
+          if os.path.exists(p):
+              s = rd(p)
+              m = re.search(r'(<style name="AppTheme\.NoActionBarLaunch"[^>]*parent="[^"]*SplashScreen[^"]*"[^>]*>)', s)
+              if m and 'windowSplashScreenBackground' not in s:
+                  s = s.replace(m.group(1), m.group(1) + '\n        <item name="windowSplashScreenBackground">#10151B</item>', 1)
+                  wr(p, s)
+          print('Android-Projekt angepasst:', APP_ID, 'versionCode', RUN)
+
+          EOF
+          python3 patch_android.py
+          npx cap sync android
+
+      - name: App bauen
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          cd android
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug bundleRelease
+
+      - name: Fuer Google Play signieren
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk out/Police-City-Testversion.apk
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ]; then
+            echo "::warning::Kein Signierschluessel hinterlegt - es gibt nur die Testversion (APK), noch keine Datei fuer Google Play."
+            exit 0
+          fi
+          echo "$KS_B64" | tr -d ' \r\n' | base64 -d > "$RUNNER_TEMP/upload.p12"
+          keytool -list -keystore "$RUNNER_TEMP/upload.p12" -storetype PKCS12 -storepass "$KS_PASS" > /dev/null
+          cp android/app/build/outputs/bundle/release/app-release.aab out/Police-City-Play-Store.aab
+          jarsigner -keystore "$RUNNER_TEMP/upload.p12" -storetype PKCS12 -storepass "$KS_PASS" -sigalg SHA256withRSA -digestalg SHA-256 out/Police-City-Play-Store.aab policecity
+          jarsigner -verify out/Police-City-Play-Store.aab | head -n 2
+
+      - name: Testversion (APK) bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Police-City-Testversion-APK
+          path: out/Police-City-Testversion.apk
+
+      - name: Play-Store-Datei (AAB) bereitstellen
+        if: hashFiles('out/Police-City-Play-Store.aab') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Police-City-Play-Store-AAB
+          path: out/Police-City-Play-Store.aab
